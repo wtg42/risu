@@ -1,7 +1,7 @@
 .{
     .name = .risu,
     .version = "0.0.1",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0-dev.1516+8a4b5424d",
     .paths = .{""},
     .fingerprint = 0x8309e8224ef0f5d4,
 }
