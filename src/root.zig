@@ -297,8 +297,10 @@ pub const TextPrompt = struct {
 
     /// Run a line-oriented text prompt and return an allocator-owned answer.
     ///
-    /// Empty input uses `initial_value` when one is configured. Validation
-    /// errors are rendered and the prompt remains active for another line.
+    /// `initial_value` is rendered as the initial editable value. An empty
+    /// submitted line uses `default_value` when one is configured; it does not
+    /// fall back to `initial_value`. Validation errors are rendered and the
+    /// prompt remains active for another line.
     pub fn run(self: *TextPrompt) RunError![]u8 {
         self.lifecycle.begin() catch return error.AlreadyStarted;
         if (self.isAborted()) {
@@ -369,7 +371,8 @@ pub const TextPrompt = struct {
     /// Run the prompt from a platform-neutral stream of key events.
     ///
     /// A terminal adapter is responsible for translating escape sequences into
-    /// `KeyEvent`; this method only owns editing, validation, and lifecycle.
+    /// `KeyEvent`; this method only owns UTF-8-safe editing, validation,
+    /// rendering requests, and lifecycle.
     pub fn runKeys(self: *TextPrompt, key_input: KeyInput) RunError![]u8 {
         self.lifecycle.begin() catch return error.AlreadyStarted;
         if (self.isAborted()) {

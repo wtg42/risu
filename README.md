@@ -41,9 +41,9 @@ defer std.heap.page_allocator.free(answer);
 
 Validation callbacks return an optional error message. `initial_value` seeds
 the editable input, while `default_value` is returned only when the submitted
-value is empty. A future prompts layer can build select, confirm, spinner, and
-terminal key handling on top of this core without changing the lifecycle
-contract.
+value is empty. An empty submission does not fall back to `initial_value`.
+A future prompts layer can build select, confirm, spinner, and other prompt
+types on top of this core without changing the lifecycle contract.
 
 `AbortController` provides a Clack-style cancellation signal:
 
@@ -70,9 +70,27 @@ before the cancellation can be observed.
 除了 `run()` 的 line input，core 也提供 `KeyEvent` / `KeyInput` 與
 `runKeys()`，目前支援 character、backspace、clear_line、delete_word、
 word_left、word_right、delete_forward、home、end、kill_to_end、redraw、left、
-right、enter、escape。
-這層不解析 OS terminal escape sequence；terminal adapter 會在後續階段把
-raw input 轉成這些事件。
+right、enter、escape、resize。
+這層不解析 OS terminal escape sequence；目前 `examples/basic.zig` 已包含
+一個 POSIX terminal adapter，負責把 raw input 與 resize signal 轉成這些
+platform-neutral events。該 adapter 目前仍是範例的一部分，尚未成為 Risu
+core 的公開 API。
+
+## Clack alignment
+
+Risu 參考 Clack 的 prompt 行為與 `core` / `prompts` 分層，但不逐行翻譯
+其 TypeScript API。目前 `TextPrompt` 核心對齊的範圍包括：
+
+- 明確的 prompt lifecycle，以及 submit、cancel、validation error 行為。
+- 可注入 input/output，使 prompt 不依賴 process-global terminal streams。
+- `initial_value`、`default_value`、placeholder 與 validation callback。
+- 可覆寫 renderer，並在每次 draw 提供 state、value、cursor 與 error context。
+- raw key-by-key editing、Ctrl-C/Escape cancellation，以及 resize redraw。
+
+目前尚未實作 Clack 的完整 styled prompts facade、frame diff renderer、全域
+settings/aliases，以及 confirm、select、spinner 等其他 prompt。POSIX raw mode、
+escape-sequence decoding、terminal width 與 ANSI cursor handling 現階段放在
+`examples/basic.zig`，並非 core contract。
 
 ## Runnable example
 
