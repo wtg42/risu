@@ -13,6 +13,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_risu_tests = b.addRunArtifact(risu_tests);
 
+    const terminal_test_module = b.createModule(.{
+        .root_source_file = b.path("src/terminal.zig"),
+        .target = target,
+    });
+    const terminal_tests = b.addTest(.{
+        .root_module = terminal_test_module,
+    });
+    const run_terminal_tests = b.addRunArtifact(terminal_tests);
+
     const example_module = b.createModule(.{
         .root_source_file = b.path("examples/basic.zig"),
         .target = target,
@@ -41,5 +50,6 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run library and example tests");
     test_step.dependOn(&run_risu_tests.step);
+    test_step.dependOn(&run_terminal_tests.step);
     test_step.dependOn(&run_example_tests.step);
 }

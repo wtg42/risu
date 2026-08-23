@@ -49,43 +49,51 @@ const TerminalKeyInput = struct {
         };
     }
 
-    fn readKey(context: *anyopaque) risu.Input.ReadError!risu.KeyEvent {
+    fn readKey(context: *anyopaque, signal: ?risu.AbortSignal) risu.Input.ReadError!risu.KeyEvent {
         const self: *TerminalKeyInput = @ptrCast(@alignCast(context));
         while (true) {
+            try checkCancelled(signal);
             if (ResizeWatcher.take()) return .resize;
-            const byte = (try self.bytes.readWithTimeout(resize_poll_ms)) orelse continue;
+            const byte = (try self.readByte(resize_poll_ms, signal)) orelse continue;
 
             if (byte == 0x1b) {
-                if (try self.readEscape()) |event| return event;
+                if (try self.readEscape(signal)) |event| return event;
                 continue;
             }
 
             if (decodeByte(byte)) |event| return event;
             if (byte >= 0x80) {
-                if (try self.readUtf8(byte)) |event| return event;
+                if (try self.readUtf8(byte, signal)) |event| return event;
             }
             // Unbound control bytes are ignored, like an unhandled key in a
             // readline-style prompt. Actual stream errors still propagate.
         }
     }
 
-    fn readEscape(self: *TerminalKeyInput) risu.Input.ReadError!?risu.KeyEvent {
-        const next = (try self.bytes.readWithTimeout(escape_timeout_ms)) orelse return .escape;
+    fn readByte(self: *TerminalKeyInput, timeout_ms: i32, signal: ?risu.AbortSignal) risu.Input.ReadError!?u8 {
+        try checkCancelled(signal);
+        const byte = try self.bytes.readWithTimeout(timeout_ms);
+        try checkCancelled(signal);
+        return byte;
+    }
+
+    fn readEscape(self: *TerminalKeyInput, signal: ?risu.AbortSignal) risu.Input.ReadError!?risu.KeyEvent {
+        const next = (try self.readByte(escape_timeout_ms, signal)) orelse return .escape;
         return switch (next) {
             'b' => .word_left, // Meta-b: common in macOS Terminal and iTerm2.
             'f' => .word_right, // Meta-f: common in macOS Terminal and iTerm2.
-            '[' => self.readCsi(),
-            0x1b => self.readMetaPrefixedArrow(),
+            '[' => self.readCsi(signal),
+            0x1b => self.readMetaPrefixedArrow(signal),
             else => null,
         };
     }
 
     /// Some terminals implement Option/Alt as an extra ESC prefix in front of
     /// their regular cursor-key sequence: ESC ESC [ D or ESC ESC [ C.
-    fn readMetaPrefixedArrow(self: *TerminalKeyInput) risu.Input.ReadError!?risu.KeyEvent {
-        const next = (try self.bytes.readWithTimeout(escape_timeout_ms)) orelse return .escape;
+    fn readMetaPrefixedArrow(self: *TerminalKeyInput, signal: ?risu.AbortSignal) risu.Input.ReadError!?risu.KeyEvent {
+        const next = (try self.readByte(escape_timeout_ms, signal)) orelse return .escape;
         if (next != '[') return null;
-        const event = (try self.readCsi()) orelse return null;
+        const event = (try self.readCsi(signal)) orelse return null;
         return switch (event) {
             .left => .word_left,
             .right => .word_right,
@@ -95,11 +103,11 @@ const TerminalKeyInput = struct {
 
     /// Decode both ordinary cursor keys (CSI D/C) and xterm-style modified
     /// cursor keys (CSI 1;3D/C, where modifier 3 means Alt/Meta).
-    fn readCsi(self: *TerminalKeyInput) risu.Input.ReadError!?risu.KeyEvent {
+    fn readCsi(self: *TerminalKeyInput, signal: ?risu.AbortSignal) risu.Input.ReadError!?risu.KeyEvent {
         var parameters: [16]u8 = undefined;
         var length: usize = 0;
         while (true) {
-            const byte = (try self.bytes.readWithTimeout(escape_timeout_ms)) orelse return .escape;
+            const byte = (try self.readByte(escape_timeout_ms, signal)) orelse return .escape;
             if (byte >= 0x40 and byte <= 0x7e) {
                 return decodeCsi(parameters[0..length], byte);
             }
@@ -109,18 +117,24 @@ const TerminalKeyInput = struct {
         }
     }
 
-    fn readUtf8(self: *TerminalKeyInput, first: u8) risu.Input.ReadError!?risu.KeyEvent {
+    fn readUtf8(self: *TerminalKeyInput, first: u8, signal: ?risu.AbortSignal) risu.Input.ReadError!?risu.KeyEvent {
         const length = std.unicode.utf8ByteSequenceLength(first) catch return null;
         var bytes: [4]u8 = undefined;
         bytes[0] = first;
         var index: usize = 1;
         while (index < length) : (index += 1) {
-            bytes[index] = (try self.bytes.readWithTimeout(escape_timeout_ms)) orelse return null;
+            bytes[index] = (try self.readByte(escape_timeout_ms, signal)) orelse return null;
         }
         const codepoint = std.unicode.utf8Decode(bytes[0..length]) catch return null;
         return .{ .character = codepoint };
     }
 };
+
+fn checkCancelled(signal: ?risu.AbortSignal) risu.Input.ReadError!void {
+    if (signal) |abort_signal| {
+        if (abort_signal.isAborted()) return error.Cancelled;
+    }
+}
 
 const ConsoleByteInput = if (builtin.os.tag == .windows) struct {
     reader: *std.Io.File.Reader,
@@ -258,6 +272,64 @@ const ConsoleOutput = struct {
     }
 };
 
+const ConsoleCapabilities = if (builtin.os.tag == .windows) struct {
+    pub fn init(_: std.Io.File) @This() {
+        return .{};
+    }
+
+    pub fn asCapabilities(self: *@This()) risu.TerminalCapabilities {
+        return .{
+            .context = self,
+            .size_fn = size,
+            .display_width_fn = displayWidth,
+        };
+    }
+
+    fn size(_: *anyopaque) risu.TerminalSize {
+        return .{ .columns = 80, .rows = 25 };
+    }
+
+    fn displayWidth(_: *anyopaque, codepoint: u21) usize {
+        return NativeWidth.width(codepoint);
+    }
+} else struct {
+    file: std.Io.File,
+
+    pub fn init(file: std.Io.File) @This() {
+        return .{ .file = file };
+    }
+
+    pub fn asCapabilities(self: *@This()) risu.TerminalCapabilities {
+        return .{
+            .context = self,
+            .size_fn = size,
+            .display_width_fn = displayWidth,
+        };
+    }
+
+    fn size(context: *anyopaque) risu.TerminalSize {
+        const self: *@This() = @ptrCast(@alignCast(context));
+        var window_size: std.posix.winsize = .{
+            .row = 0,
+            .col = 0,
+            .xpixel = 0,
+            .ypixel = 0,
+        };
+        const request: c_int = @bitCast(@as(c_uint, @intCast(std.posix.T.IOCGWINSZ)));
+        if (std.posix.system.ioctl(self.file.handle, request, &window_size) < 0) {
+            return .{ .columns = 80, .rows = 25 };
+        }
+        return .{
+            .columns = if (window_size.col == 0) 80 else window_size.col,
+            .rows = if (window_size.row == 0) 25 else window_size.row,
+        };
+    }
+
+    fn displayWidth(_: *anyopaque, codepoint: u21) usize {
+        return NativeWidth.width(codepoint);
+    }
+};
+
 /// POSIX raw mode is deliberately kept in the example adapter. The core only
 /// consumes platform-neutral KeyEvent values.
 const RawTerminal = if (builtin.os.tag == .windows) struct {
@@ -331,59 +403,46 @@ fn validateName(value: []const u8) ?[]const u8 {
 }
 
 fn renderPrompt(output: risu.Output, view: risu.TextPrompt.RenderContext) risu.Output.WriteError!void {
-    try output.write("\r\x1b[2K? ");
+    const prefix = switch (view.state) {
+        .submitted => "done ",
+        .cancelled => "cancelled ",
+        else => "? ",
+    };
+    try output.write(prefix);
     try output.write(view.message);
-    if (view.value.len > 0) {
+    const displayed_value = view.submitted_value orelse view.value;
+    if (displayed_value.len > 0) {
         try output.write(" ");
-        try output.write(view.value);
-    } else if (view.placeholder) |placeholder| {
+        if (view.state == .active) {
+            try renderInputWithCursor(output, view.value, view.cursor);
+        } else {
+            try output.write(displayed_value);
+        }
+    } else if (view.state == .active) if (view.placeholder) |placeholder| {
         try output.write(" [");
         try output.write(placeholder);
         try output.write("]");
-    }
+    };
 
     if (view.validation_error) |message| {
-        try output.write("\n\x1b[2Kerror: ");
+        try output.write("\nerror: ");
         try output.write(message);
-        try output.write("\n");
-        try output.write("? ");
-        try output.write(view.message);
-        if (view.value.len > 0) {
-            try output.write(" ");
-            try output.write(view.value);
-        }
-    }
-
-    var move_left = displayWidth(view.value[view.cursor..]);
-    while (move_left > 0) : (move_left -= 1) {
-        try output.write("\x1b[D");
     }
 }
 
-/// Return terminal columns, not UTF-8 bytes, so the rendered cursor is also
-/// correct after a wide code point such as a CJK character.
-fn displayWidth(value: []const u8) usize {
-    var index: usize = 0;
-    var columns: usize = 0;
-    while (index < value.len) {
-        const width = std.unicode.utf8ByteSequenceLength(value[index]) catch {
-            index += 1;
-            columns += 1;
-            continue;
-        };
-        if (index + width > value.len) {
-            columns += 1;
-            break;
-        }
-        const codepoint = std.unicode.utf8Decode(value[index .. index + width]) catch {
-            index += 1;
-            columns += 1;
-            continue;
-        };
-        columns += NativeWidth.width(codepoint);
-        index += width;
+fn renderInputWithCursor(output: risu.Output, value: []const u8, cursor: usize) risu.Output.WriteError!void {
+    try output.write(value[0..cursor]);
+    try output.write("\x1b[7m");
+    if (cursor < value.len) {
+        const width = std.unicode.utf8ByteSequenceLength(value[cursor]) catch 1;
+        const end = @min(cursor + width, value.len);
+        try output.write(value[cursor..end]);
+        try output.write("\x1b[27m");
+        try output.write(value[end..]);
+    } else {
+        try output.write(" ");
+        try output.write("\x1b[27m");
     }
-    return columns;
 }
 
 pub fn runPrompt(allocator: std.mem.Allocator, input: risu.KeyInput, output: risu.Output) risu.TextPrompt.RunError![]u8 {
@@ -411,6 +470,13 @@ pub fn main() !void {
     var output_buffer: [4096]u8 = undefined;
     var file_writer = stdout_file.writerStreaming(io, &output_buffer);
     var output = ConsoleOutput{ .writer = &file_writer };
+    var capabilities = ConsoleCapabilities.init(stdout_file);
+    var framed_output = risu.TerminalFrameOutput.init(
+        allocator,
+        output.asOutput(),
+        capabilities.asCapabilities(),
+    );
+    defer framed_output.deinit();
 
     try output.writeText("TextPrompt key-event demo\n");
     try output.writeText("Use arrows, Alt/Option-arrows, Backspace, Ctrl-A/E/U/W/K/D/L, Enter, or Ctrl-C.\n");
@@ -418,12 +484,16 @@ pub fn main() !void {
     var terminal = try RawTerminal.enter(stdin_file);
     defer terminal.deinit();
 
-    const answer = runPrompt(allocator, input.asInput(), output.asOutput()) catch |err| switch (err) {
+    const answer = runPrompt(allocator, input.asInput(), framed_output.asOutput()) catch |err| switch (err) {
         error.Cancelled => {
+            framed_output.deinit();
+            terminal.deinit();
             try output.writeText("\nCancelled.\n");
             return;
         },
         error.EndOfInput => {
+            framed_output.deinit();
+            terminal.deinit();
             try output.writeText("\nNo input received.\n");
             return;
         },
@@ -431,6 +501,8 @@ pub fn main() !void {
     };
     defer allocator.free(answer);
 
+    framed_output.deinit();
+    terminal.deinit();
     try output.writeText("\nHello, ");
     try output.writeText(answer);
     try output.writeText("!\n");
@@ -451,7 +523,67 @@ test "example app uses the risu key-event prompt" {
 
     try std.testing.expectEqualStrings("Ada", answer);
     try std.testing.expect(std.mem.indexOf(u8, output.items(), "What is your name?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.items(), "Ada") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "done What is your name? Ada") != null);
+}
+
+const FixedTestCapabilities = struct {
+    fn asCapabilities(self: *FixedTestCapabilities) risu.TerminalCapabilities {
+        return .{
+            .context = self,
+            .size_fn = size,
+            .display_width_fn = width,
+        };
+    }
+
+    fn size(_: *anyopaque) risu.TerminalSize {
+        return .{ .columns = 80, .rows = 20 };
+    }
+
+    fn width(_: *anyopaque, _: u21) usize {
+        return 1;
+    }
+};
+
+test "example prompt renders through terminal frame output and restores the cursor" {
+    var input = risu.KeyInputSequence.init(&.{
+        .{ .character = 'A' },
+        .{ .character = 'd' },
+        .{ .character = 'a' },
+        .enter,
+    });
+    var destination = risu.BufferOutput.init(std.testing.allocator);
+    defer destination.deinit();
+    var capabilities = FixedTestCapabilities{};
+    var framed_output = risu.TerminalFrameOutput.init(
+        std.testing.allocator,
+        destination.asOutput(),
+        capabilities.asCapabilities(),
+    );
+    defer framed_output.deinit();
+
+    const answer = try runPrompt(std.testing.allocator, input.asInput(), framed_output.asOutput());
+    defer std.testing.allocator.free(answer);
+    framed_output.deinit();
+
+    try std.testing.expect(std.mem.startsWith(u8, destination.items(), "\x1b[?25l"));
+    try std.testing.expect(std.mem.indexOf(u8, destination.items(), "done What is your name? Ada") != null);
+    try std.testing.expect(std.mem.endsWith(u8, destination.items(), "\x1b[?25h"));
+    try std.testing.expect(std.mem.indexOf(u8, destination.items(), "\x1b[D") == null);
+}
+
+test "example prompt renders a final cancelled frame" {
+    var input = risu.KeyInputSequence.init(&.{
+        .{ .character = 'x' },
+        .escape,
+    });
+    var output = risu.BufferOutput.init(std.testing.allocator);
+    defer output.deinit();
+
+    try std.testing.expectError(
+        error.Cancelled,
+        runPrompt(std.testing.allocator, input.asInput(), output.asOutput()),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "cancelled What is your name? x") != null);
 }
 
 test "console key decoder maps terminal bytes" {
@@ -502,19 +634,52 @@ const TestByteInput = struct {
     }
 };
 
+const AbortOnTimeoutByteInput = struct {
+    controller: *risu.AbortController,
+
+    fn asInput(self: *AbortOnTimeoutByteInput) ByteInput {
+        return .{
+            .context = self,
+            .read_fn = read,
+            .read_with_timeout_fn = readWithTimeout,
+        };
+    }
+
+    fn read(_: *anyopaque) risu.Input.ReadError!u8 {
+        return error.EndOfInput;
+    }
+
+    fn readWithTimeout(context: *anyopaque, _: i32) risu.Input.ReadError!?u8 {
+        const self: *AbortOnTimeoutByteInput = @ptrCast(@alignCast(context));
+        self.controller.abort();
+        return null;
+    }
+};
+
+test "terminal key input observes aborts during bounded waits" {
+    var controller = risu.AbortController.init();
+    var byte_input = AbortOnTimeoutByteInput{ .controller = &controller };
+    var keys = TerminalKeyInput.init(byte_input.asInput());
+
+    try std.testing.expectError(
+        error.Cancelled,
+        keys.asInput().readKey(controller.signal()),
+    );
+}
+
 test "terminal key decoder handles UTF-8 and an escape timeout" {
     var unicode_bytes = TestByteInput.init("界");
     var unicode_keys = TerminalKeyInput.init(unicode_bytes.asInput());
-    const unicode_event = try unicode_keys.asInput().readKey();
+    const unicode_event = try unicode_keys.asInput().readKey(null);
     try std.testing.expectEqual(@as(u21, '界'), unicode_event.character);
 
     var escape_bytes = TestByteInput.init(&.{0x1b});
     var escape_keys = TerminalKeyInput.init(escape_bytes.asInput());
-    try std.testing.expectEqual(risu.KeyEvent.escape, try escape_keys.asInput().readKey());
+    try std.testing.expectEqual(risu.KeyEvent.escape, try escape_keys.asInput().readKey(null));
 
     var arrow_bytes = TestByteInput.init("\x1b[D");
     var arrow_keys = TerminalKeyInput.init(arrow_bytes.asInput());
-    try std.testing.expectEqual(risu.KeyEvent.left, try arrow_keys.asInput().readKey());
+    try std.testing.expectEqual(risu.KeyEvent.left, try arrow_keys.asInput().readKey(null));
 }
 
 test "terminal key decoder maps common Alt or Option arrow encodings" {
@@ -534,6 +699,6 @@ test "terminal key decoder maps common Alt or Option arrow encodings" {
     for (cases) |case| {
         var byte_input = TestByteInput.init(case.bytes);
         var keys = TerminalKeyInput.init(byte_input.asInput());
-        try std.testing.expectEqual(case.expected, try keys.asInput().readKey());
+        try std.testing.expectEqual(case.expected, try keys.asInput().readKey(null));
     }
 }

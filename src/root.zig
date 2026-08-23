@@ -2,6 +2,14 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const terminal = @import("terminal.zig");
+
+/// Current terminal dimensions in character cells.
+pub const TerminalSize = terminal.TerminalSize;
+/// Injected terminal dimensions and Unicode display-width policy.
+pub const TerminalCapabilities = terminal.TerminalCapabilities;
+/// An output adapter that atomically wraps and replaces rendered frames.
+pub const TerminalFrameOutput = terminal.FrameOutput(Output);
 
 pub const PromptState = enum {
     idle,
@@ -50,6 +58,8 @@ pub const Prompt = struct {
 
 /// Input is an intentionally small type-erased line source. A terminal,
 /// scripted test, or another application can provide its own implementation.
+/// Blocking implementations must wake or use bounded waits to observe the
+/// optional abort signal passed to `readLine`.
 pub const Input = struct {
     pub const ReadError = error{
         EndOfInput,
@@ -58,17 +68,18 @@ pub const Input = struct {
     };
 
     context: *anyopaque,
-    read_line_fn: *const fn (context: *anyopaque) ReadError![]const u8,
+    read_line_fn: *const fn (context: *anyopaque, signal: ?AbortSignal) ReadError![]const u8,
 
-    pub fn readLine(self: Input) ReadError![]const u8 {
-        return self.read_line_fn(self.context);
+    pub fn readLine(self: Input, signal: ?AbortSignal) ReadError![]const u8 {
+        return self.read_line_fn(self.context, signal);
     }
 };
 
 /// A type-erased cancellation probe for prompt execution.
 ///
-/// Prompt input adapters remain synchronous. A prompt checks the signal before
-/// it renders, before it reads the next input item, and after that read returns.
+/// Prompt input adapters remain synchronous. A prompt checks the signal around
+/// rendering and input, and passes it into reads so blocking adapters can wake
+/// or poll for cancellation.
 pub const AbortSignal = struct {
     context: *const anyopaque,
     is_aborted_fn: *const fn (context: *const anyopaque) bool,
@@ -124,8 +135,11 @@ pub const LineInput = struct {
         };
     }
 
-    fn readLine(context: *anyopaque) Input.ReadError![]const u8 {
+    fn readLine(context: *anyopaque, signal: ?AbortSignal) Input.ReadError![]const u8 {
         const self: *LineInput = @ptrCast(@alignCast(context));
+        if (signal) |abort_signal| {
+            if (abort_signal.isAborted()) return error.Cancelled;
+        }
         if (self.index >= self.events.len) return error.EndOfInput;
 
         const event = self.events[self.index];
@@ -161,12 +175,13 @@ pub const KeyEvent = union(enum) {
 };
 
 /// Type-erased key-event input for interactive prompt implementations.
+/// Blocking implementations follow the same cancellation contract as `Input`.
 pub const KeyInput = struct {
     context: *anyopaque,
-    read_key_fn: *const fn (context: *anyopaque) Input.ReadError!KeyEvent,
+    read_key_fn: *const fn (context: *anyopaque, signal: ?AbortSignal) Input.ReadError!KeyEvent,
 
-    pub fn readKey(self: KeyInput) Input.ReadError!KeyEvent {
-        return self.read_key_fn(self.context);
+    pub fn readKey(self: KeyInput, signal: ?AbortSignal) Input.ReadError!KeyEvent {
+        return self.read_key_fn(self.context, signal);
     }
 };
 
@@ -186,8 +201,11 @@ pub const KeyInputSequence = struct {
         };
     }
 
-    fn readKey(context: *anyopaque) Input.ReadError!KeyEvent {
+    fn readKey(context: *anyopaque, signal: ?AbortSignal) Input.ReadError!KeyEvent {
         const self: *KeyInputSequence = @ptrCast(@alignCast(context));
+        if (signal) |abort_signal| {
+            if (abort_signal.isAborted()) return error.Cancelled;
+        }
         if (self.index >= self.events.len) return error.EndOfInput;
 
         const event = self.events[self.index];
@@ -197,14 +215,30 @@ pub const KeyInputSequence = struct {
 };
 
 /// Output is also type-erased so core logic is testable without a real TTY.
+/// Optional frame callbacks let an adapter buffer and atomically commit or
+/// discard all writes made by one renderer invocation.
 pub const Output = struct {
     pub const WriteError = error{WriteFailed};
 
     context: *anyopaque,
     write_fn: *const fn (context: *anyopaque, bytes: []const u8) WriteError!void,
+    begin_frame_fn: ?*const fn (context: *anyopaque) WriteError!void = null,
+    finish_frame_fn: ?*const fn (context: *anyopaque, commit: bool) WriteError!void = null,
 
     pub fn write(self: Output, bytes: []const u8) WriteError!void {
         return self.write_fn(self.context, bytes);
+    }
+
+    pub fn beginFrame(self: Output) WriteError!void {
+        if (self.begin_frame_fn) |begin_frame| {
+            try begin_frame(self.context);
+        }
+    }
+
+    pub fn finishFrame(self: Output, commit: bool) WriteError!void {
+        if (self.finish_frame_fn) |finish_frame| {
+            try finish_frame(self.context, commit);
+        }
     }
 };
 
@@ -248,6 +282,8 @@ pub const TextPrompt = struct {
         state: PromptState,
         validation_error: ?[]const u8,
         value: []const u8,
+        /// Resolved result for the submitted frame; otherwise null.
+        submitted_value: ?[]const u8,
         /// Byte offset into `value`, always maintained at a UTF-8 code point boundary.
         cursor: usize,
     };
@@ -298,9 +334,9 @@ pub const TextPrompt = struct {
     /// Run a line-oriented text prompt and return an allocator-owned answer.
     ///
     /// `initial_value` is rendered as the initial editable value. An empty
-    /// submitted line uses `default_value` when one is configured; it does not
-    /// fall back to `initial_value`. Validation errors are rendered and the
-    /// prompt remains active for another line.
+    /// submitted line is validated before it uses `default_value` when one is
+    /// configured; it does not fall back to `initial_value`. Validation errors
+    /// preserve the rejected line, and terminal states receive a final frame.
     pub fn run(self: *TextPrompt) RunError![]u8 {
         self.lifecycle.begin() catch return error.AlreadyStarted;
         if (self.isAborted()) {
@@ -312,41 +348,41 @@ pub const TextPrompt = struct {
             return error.InputFailed;
         };
         const initial = self.options.initial_value orelse &.{};
-        self.renderPrompt(initial, initial.len) catch {
+        var rendered_value = initial;
+        self.renderPrompt(initial, initial.len, null) catch {
             self.markCancelled();
             return error.OutputFailed;
         };
 
         while (true) {
             if (self.isAborted()) {
-                self.markCancelled();
+                try self.cancelAndRender(rendered_value, rendered_value.len);
                 return error.Cancelled;
             }
-            const line = input.readLine() catch |err| switch (err) {
+            const line = input.readLine(self.options.signal) catch |err| switch (err) {
                 error.Cancelled => {
-                    self.markCancelled();
+                    try self.cancelAndRender(rendered_value, rendered_value.len);
                     return error.Cancelled;
                 },
                 error.EndOfInput => {
-                    self.markCancelled();
+                    try self.cancelAndRender(rendered_value, rendered_value.len);
                     return error.EndOfInput;
                 },
                 error.ReadFailed => {
-                    self.markCancelled();
+                    try self.cancelAndRender(rendered_value, rendered_value.len);
                     return error.InputFailed;
                 },
             };
+            rendered_value = line;
             if (self.isAborted()) {
-                self.markCancelled();
+                try self.cancelAndRender(line, line.len);
                 return error.Cancelled;
             }
 
-            const value = self.valueOrDefault(line);
-
             if (self.options.validate) |validate| {
-                if (validate(value)) |message| {
+                if (validate(line)) |message| {
                     self.validation_error = message;
-                    self.renderPrompt(&.{}, 0) catch {
+                    self.renderPrompt(line, line.len, null) catch {
                         self.markCancelled();
                         return error.OutputFailed;
                     };
@@ -355,6 +391,7 @@ pub const TextPrompt = struct {
                 }
             }
 
+            const value = self.valueOrDefault(line);
             const answer = self.allocator.dupe(u8, value) catch {
                 self.markCancelled();
                 return error.OutOfMemory;
@@ -364,6 +401,10 @@ pub const TextPrompt = struct {
                 self.markCancelled();
                 return error.InvalidState;
             };
+            self.renderPrompt(line, line.len, answer) catch {
+                self.allocator.free(answer);
+                return error.OutputFailed;
+            };
             return answer;
         }
     }
@@ -372,7 +413,8 @@ pub const TextPrompt = struct {
     ///
     /// A terminal adapter is responsible for translating escape sequences into
     /// `KeyEvent`; this method only owns UTF-8-safe editing, validation,
-    /// rendering requests, and lifecycle.
+    /// rendering requests, and lifecycle. Validation precedes default
+    /// resolution, and submitted or cancelled states receive a final frame.
     pub fn runKeys(self: *TextPrompt, key_input: KeyInput) RunError![]u8 {
         self.lifecycle.begin() catch return error.AlreadyStarted;
         if (self.isAborted()) {
@@ -396,32 +438,32 @@ pub const TextPrompt = struct {
             cursor = value.items.len;
         }
 
-        self.renderPrompt(value.items, cursor) catch {
+        self.renderPrompt(value.items, cursor, null) catch {
             self.markCancelled();
             return error.OutputFailed;
         };
 
         while (true) {
             if (self.isAborted()) {
-                self.markCancelled();
+                try self.cancelAndRender(value.items, cursor);
                 return error.Cancelled;
             }
-            const event = key_input.readKey() catch |err| switch (err) {
+            const event = key_input.readKey(self.options.signal) catch |err| switch (err) {
                 error.Cancelled => {
-                    self.markCancelled();
+                    try self.cancelAndRender(value.items, cursor);
                     return error.Cancelled;
                 },
                 error.EndOfInput => {
-                    self.markCancelled();
+                    try self.cancelAndRender(value.items, cursor);
                     return error.EndOfInput;
                 },
                 error.ReadFailed => {
-                    self.markCancelled();
+                    try self.cancelAndRender(value.items, cursor);
                     return error.InputFailed;
                 },
             };
             if (self.isAborted()) {
-                self.markCancelled();
+                try self.cancelAndRender(value.items, cursor);
                 return error.Cancelled;
             }
 
@@ -479,7 +521,7 @@ pub const TextPrompt = struct {
                 },
                 .delete_forward => {
                     if (value.items.len == 0) {
-                        self.markCancelled();
+                        try self.cancelAndRender(value.items, cursor);
                         return error.EndOfInput;
                     }
                     if (cursor < value.items.len) {
@@ -499,16 +541,14 @@ pub const TextPrompt = struct {
                     if (cursor < value.items.len) cursor = nextCodepointEnd(value.items, cursor);
                 },
                 .escape => {
-                    self.markCancelled();
+                    try self.cancelAndRender(value.items, cursor);
                     return error.Cancelled;
                 },
                 .enter => {
-                    const candidate = self.valueOrDefault(value.items);
-
                     if (self.options.validate) |validate| {
-                        if (validate(candidate)) |message| {
+                        if (validate(value.items)) |message| {
                             self.validation_error = message;
-                            self.renderPrompt(value.items, cursor) catch {
+                            self.renderPrompt(value.items, cursor, null) catch {
                                 self.markCancelled();
                                 return error.OutputFailed;
                             };
@@ -517,6 +557,7 @@ pub const TextPrompt = struct {
                         }
                     }
 
+                    const candidate = self.valueOrDefault(value.items);
                     const answer = self.allocator.dupe(u8, candidate) catch {
                         self.markCancelled();
                         return error.OutOfMemory;
@@ -526,29 +567,46 @@ pub const TextPrompt = struct {
                         self.markCancelled();
                         return error.InvalidState;
                     };
+                    self.renderPrompt(value.items, cursor, answer) catch {
+                        self.allocator.free(answer);
+                        return error.OutputFailed;
+                    };
                     return answer;
                 },
             }
 
-            self.renderPrompt(value.items, cursor) catch {
+            self.renderPrompt(value.items, cursor, null) catch {
                 self.markCancelled();
                 return error.OutputFailed;
             };
         }
     }
 
-    fn renderPrompt(self: *TextPrompt, value: []const u8, cursor: usize) Output.WriteError!void {
+    fn renderPrompt(
+        self: *TextPrompt,
+        value: []const u8,
+        cursor: usize,
+        submitted_value: ?[]const u8,
+    ) Output.WriteError!void {
         const view: RenderContext = .{
             .message = self.options.message,
             .placeholder = self.options.placeholder,
             .state = self.lifecycle.state(),
             .validation_error = self.validation_error,
             .value = value,
+            .submitted_value = submitted_value,
             .cursor = cursor,
         };
-        if (self.options.render) |render| {
-            return render(self.output, view);
-        }
+        try self.output.beginFrame();
+        self.renderFrame(view) catch |err| {
+            self.output.finishFrame(false) catch {};
+            return err;
+        };
+        try self.output.finishFrame(true);
+    }
+
+    fn renderFrame(self: *TextPrompt, view: RenderContext) Output.WriteError!void {
+        if (self.options.render) |render| return render(self.output, view);
 
         if (view.validation_error) |message| {
             try self.output.write("\nerror: ");
@@ -556,14 +614,15 @@ pub const TextPrompt = struct {
             try self.output.write("\n");
         }
         try self.output.write(view.message);
-        if (view.value.len > 0) {
+        const displayed_value = view.submitted_value orelse view.value;
+        if (displayed_value.len > 0) {
             try self.output.write(" ");
-            try self.output.write(view.value);
-        } else if (view.placeholder) |placeholder| {
+            try self.output.write(displayed_value);
+        } else if (view.state == .active) if (view.placeholder) |placeholder| {
             try self.output.write(" [");
             try self.output.write(placeholder);
             try self.output.write("]");
-        }
+        };
         try self.output.write(" ");
     }
 
@@ -608,6 +667,11 @@ pub const TextPrompt = struct {
             self.lifecycle.cancel() catch {};
         }
     }
+
+    fn cancelAndRender(self: *TextPrompt, value: []const u8, cursor: usize) RunError!void {
+        self.markCancelled();
+        self.renderPrompt(value, cursor, null) catch return error.OutputFailed;
+    }
 };
 
 test "text prompt returns an entered line" {
@@ -624,7 +688,7 @@ test "text prompt returns an entered line" {
 
     try std.testing.expectEqualStrings("Ada", answer);
     try std.testing.expectEqual(PromptState.submitted, prompt.state());
-    try std.testing.expectEqualStrings("Your name? ", output.items());
+    try std.testing.expectEqualStrings("Your name? Your name? Ada ", output.items());
 }
 
 fn atLeastTwoCharacters(value: []const u8) ?[]const u8 {
@@ -650,7 +714,7 @@ test "text prompt retries validation errors and renders each attempt" {
 
     try std.testing.expectEqualStrings("Ada", answer);
     try std.testing.expectEqualStrings(
-        "Your name? \nerror: Use at least two characters.\nYour name? ",
+        "Your name? \nerror: Use at least two characters.\nYour name? A Your name? Ada ",
         output.items(),
     );
 }
@@ -690,7 +754,7 @@ test "initial value is rendered and default value is the empty fallback" {
     defer std.testing.allocator.free(answer);
 
     try std.testing.expectEqualStrings("risu", answer);
-    try std.testing.expectEqualStrings("draft|\n|\n", output.items());
+    try std.testing.expectEqualStrings("draft|\n|\nrisu|\n", output.items());
 }
 
 test "initial value is editable" {
@@ -711,7 +775,7 @@ test "initial value is editable" {
     defer std.testing.allocator.free(answer);
 
     try std.testing.expectEqualStrings("draftX", answer);
-    try std.testing.expectEqualStrings("draft|\ndraftX|\n", output.items());
+    try std.testing.expectEqualStrings("draft|\ndraftX|\ndraftX|\n", output.items());
 }
 
 test "line prompt uses default value instead of initial value for empty input" {
@@ -758,7 +822,7 @@ const AbortDuringReadInput = struct {
         };
     }
 
-    fn readLine(context: *anyopaque) Input.ReadError![]const u8 {
+    fn readLine(context: *anyopaque, _: ?AbortSignal) Input.ReadError![]const u8 {
         const self: *AbortDuringReadInput = @ptrCast(@alignCast(context));
         self.controller.abort();
         return "Ada";
@@ -790,7 +854,7 @@ const AbortDuringKeyReadInput = struct {
         };
     }
 
-    fn readKey(context: *anyopaque) Input.ReadError!KeyEvent {
+    fn readKey(context: *anyopaque, _: ?AbortSignal) Input.ReadError!KeyEvent {
         const self: *AbortDuringKeyReadInput = @ptrCast(@alignCast(context));
         self.controller.abort();
         return .enter;
@@ -825,7 +889,24 @@ test "placeholder is included in the rendered prompt" {
     const answer = try prompt.run();
     defer std.testing.allocator.free(answer);
 
-    try std.testing.expectEqualStrings("Project name? [my-project] ", output.items());
+    try std.testing.expectEqualStrings("Project name? [my-project] Project name? risu ", output.items());
+}
+
+test "placeholder is omitted from an empty submitted final frame" {
+    var input = LineInput.init(&.{.{ .line = "" }});
+    var output = BufferOutput.init(std.testing.allocator);
+    defer output.deinit();
+
+    var prompt = TextPrompt.init(std.testing.allocator, input.asInput(), output.asOutput(), .{
+        .message = "Project name?",
+        .placeholder = "my-project",
+    });
+
+    const answer = try prompt.run();
+    defer std.testing.allocator.free(answer);
+
+    try std.testing.expectEqualStrings("", answer);
+    try std.testing.expectEqualStrings("Project name? [my-project] Project name? ", output.items());
 }
 
 test "cancellation is terminal and cannot be submitted" {
@@ -916,15 +997,18 @@ test "text prompt accepts a custom renderer" {
 
     try std.testing.expectEqualStrings("Ada", answer);
     try std.testing.expectEqualStrings(
-        "[active] Your name? [Ada] [active] Your name? [Ada] ! Use at least two characters. ",
+        "[active] Your name? [Ada] [active] Your name? [Ada] ! Use at least two characters. " ++
+            "[submitted] Your name? [Ada] ",
         output.items(),
     );
 }
 
 fn renderKeyFrame(output: Output, view: TextPrompt.RenderContext) Output.WriteError!void {
-    try output.write(view.value[0..view.cursor]);
+    const displayed_value = view.submitted_value orelse view.value;
+    const displayed_cursor = if (view.submitted_value != null) displayed_value.len else view.cursor;
+    try output.write(displayed_value[0..displayed_cursor]);
     try output.write("|");
-    try output.write(view.value[view.cursor..]);
+    try output.write(displayed_value[displayed_cursor..]);
     if (view.validation_error) |message| {
         try output.write(" error: ");
         try output.write(message);
@@ -956,7 +1040,7 @@ test "text prompt edits key events and submits the current value" {
 
     try std.testing.expectEqualStrings("Ada", answer);
     try std.testing.expectEqualStrings(
-        "|\nA|\nAd|\nAda|\nAd|a\nA|a\nAd|a\nAda|\n",
+        "|\nA|\nAd|\nAda|\nAd|a\nA|a\nAd|a\nAda|\nAda|\n",
         output.items(),
     );
     try std.testing.expectEqual(PromptState.submitted, prompt.state());
@@ -1015,7 +1099,7 @@ test "key prompt clears the current line" {
     defer std.testing.allocator.free(answer);
 
     try std.testing.expectEqualStrings("Z", answer);
-    try std.testing.expectEqualStrings("|\nA|\nAd|\n|\nZ|\n", output.items());
+    try std.testing.expectEqualStrings("|\nA|\nAd|\n|\nZ|\nZ|\n", output.items());
 }
 
 test "key prompt supports common Unix editing controls" {
@@ -1065,6 +1149,7 @@ test "key prompt treats delete-forward on an empty value as EOF" {
 
     try std.testing.expectError(error.EndOfInput, prompt.runKeys(input.asInput()));
     try std.testing.expectEqual(PromptState.cancelled, prompt.state());
+    try std.testing.expectEqualStrings("|\n|\n", output.items());
 }
 
 test "key prompt edits UTF-8 code points without splitting them" {
@@ -1088,7 +1173,7 @@ test "key prompt edits UTF-8 code points without splitting them" {
     defer std.testing.allocator.free(answer);
 
     try std.testing.expectEqualStrings("你A", answer);
-    try std.testing.expectEqualStrings("|\n界|\n界A|\n界|A\n|A\n你|A\n", output.items());
+    try std.testing.expectEqualStrings("|\n界|\n界A|\n界|A\n|A\n你|A\n你A|\n", output.items());
 }
 
 test "key prompt forward-deletes one UTF-8 code point" {
@@ -1158,7 +1243,264 @@ test "resize events re-render without changing the value" {
     defer std.testing.allocator.free(answer);
 
     try std.testing.expectEqualStrings("A", answer);
-    try std.testing.expectEqualStrings("|\nA|\nA|\n", output.items());
+    try std.testing.expectEqualStrings("|\nA|\nA|\nA|\n", output.items());
+}
+
+fn rejectEmpty(value: []const u8) ?[]const u8 {
+    if (value.len == 0) return "Input is required.";
+    return null;
+}
+
+fn renderLifecycleFrame(output: Output, view: TextPrompt.RenderContext) Output.WriteError!void {
+    try output.write(@tagName(view.state));
+    try output.write(":");
+    try output.write(view.value);
+    try output.write("=>");
+    if (view.submitted_value) |submitted_value| {
+        try output.write(submitted_value);
+    } else {
+        try output.write("-");
+    }
+    if (view.validation_error) |message| {
+        try output.write("!");
+        try output.write(message);
+    }
+    try output.write("\n");
+}
+
+test "text prompt validates raw input before resolving the default" {
+    var input = LineInput.init(&.{
+        .{ .line = "" },
+        .{ .line = "Ada" },
+    });
+    var output = BufferOutput.init(std.testing.allocator);
+    defer output.deinit();
+
+    var prompt = TextPrompt.init(std.testing.allocator, input.asInput(), output.asOutput(), .{
+        .message = "Your name?",
+        .default_value = "Grace",
+        .validate = rejectEmpty,
+        .render = renderLifecycleFrame,
+    });
+
+    const answer = try prompt.run();
+    defer std.testing.allocator.free(answer);
+
+    try std.testing.expectEqualStrings("Ada", answer);
+    try std.testing.expectEqualStrings(
+        "active:=>-\n" ++
+            "active:=>-!Input is required.\n" ++
+            "submitted:Ada=>Ada\n",
+        output.items(),
+    );
+}
+
+test "accepted empty input exposes a resolved default only in the submitted frame" {
+    var input = LineInput.init(&.{.{ .line = "" }});
+    var output = BufferOutput.init(std.testing.allocator);
+    defer output.deinit();
+
+    var prompt = TextPrompt.init(std.testing.allocator, input.asInput(), output.asOutput(), .{
+        .message = "Project?",
+        .default_value = "risu",
+        .render = renderLifecycleFrame,
+    });
+
+    const answer = try prompt.run();
+    defer std.testing.allocator.free(answer);
+
+    try std.testing.expectEqualStrings("risu", answer);
+    try std.testing.expectEqualStrings("active:=>-\nsubmitted:=>risu\n", output.items());
+}
+
+test "line validation error preserves the rejected value" {
+    var input = LineInput.init(&.{
+        .{ .line = "A" },
+        .{ .line = "Ada" },
+    });
+    var output = BufferOutput.init(std.testing.allocator);
+    defer output.deinit();
+
+    var prompt = TextPrompt.init(std.testing.allocator, input.asInput(), output.asOutput(), .{
+        .message = "Your name?",
+        .validate = atLeastTwoCharacters,
+        .render = renderLifecycleFrame,
+    });
+
+    const answer = try prompt.run();
+    defer std.testing.allocator.free(answer);
+
+    try std.testing.expectEqualStrings("Ada", answer);
+    try std.testing.expect(std.mem.indexOf(u8, output.items(), "active:A=>-!Use at least two characters.") != null);
+}
+
+test "key cancellation renders the typed value in a final frame" {
+    var input = KeyInputSequence.init(&.{
+        .{ .character = 'x' },
+        .escape,
+    });
+    var output = BufferOutput.init(std.testing.allocator);
+    defer output.deinit();
+
+    var prompt = TextPrompt.init(std.testing.allocator, null, output.asOutput(), .{
+        .message = "Value?",
+        .render = renderLifecycleFrame,
+    });
+
+    try std.testing.expectError(error.Cancelled, prompt.runKeys(input.asInput()));
+    try std.testing.expectEqualStrings(
+        "active:=>-\nactive:x=>-\ncancelled:x=>-\n",
+        output.items(),
+    );
+}
+
+const RecordingFrameOutput = struct {
+    allocator: Allocator,
+    frame: std.ArrayList(u8) = .empty,
+    committed: std.ArrayList(u8) = .empty,
+    in_frame: bool = false,
+
+    fn init(allocator: Allocator) RecordingFrameOutput {
+        return .{ .allocator = allocator };
+    }
+
+    fn deinit(self: *RecordingFrameOutput) void {
+        self.frame.deinit(self.allocator);
+        self.committed.deinit(self.allocator);
+    }
+
+    fn asOutput(self: *RecordingFrameOutput) Output {
+        return .{
+            .context = self,
+            .write_fn = write,
+            .begin_frame_fn = beginFrame,
+            .finish_frame_fn = finishFrame,
+        };
+    }
+
+    fn write(context: *anyopaque, bytes: []const u8) Output.WriteError!void {
+        const self: *RecordingFrameOutput = @ptrCast(@alignCast(context));
+        const destination = if (self.in_frame) &self.frame else &self.committed;
+        destination.appendSlice(self.allocator, bytes) catch return error.WriteFailed;
+    }
+
+    fn beginFrame(context: *anyopaque) Output.WriteError!void {
+        const self: *RecordingFrameOutput = @ptrCast(@alignCast(context));
+        self.frame.clearRetainingCapacity();
+        self.in_frame = true;
+    }
+
+    fn finishFrame(context: *anyopaque, commit: bool) Output.WriteError!void {
+        const self: *RecordingFrameOutput = @ptrCast(@alignCast(context));
+        defer {
+            self.frame.clearRetainingCapacity();
+            self.in_frame = false;
+        }
+        if (!commit) return;
+        self.committed.append(self.allocator, '[') catch return error.WriteFailed;
+        self.committed.appendSlice(self.allocator, self.frame.items) catch return error.WriteFailed;
+        self.committed.append(self.allocator, ']') catch return error.WriteFailed;
+    }
+};
+
+test "renderer writes are committed as atomic frames" {
+    var input = LineInput.init(&.{.{ .line = "Ada" }});
+    var output = RecordingFrameOutput.init(std.testing.allocator);
+    defer output.deinit();
+
+    var prompt = TextPrompt.init(std.testing.allocator, input.asInput(), output.asOutput(), .{
+        .message = "Name?",
+        .render = renderLifecycleFrame,
+    });
+
+    const answer = try prompt.run();
+    defer std.testing.allocator.free(answer);
+
+    try std.testing.expectEqualStrings(
+        "[active:=>-\n][submitted:Ada=>Ada\n]",
+        output.committed.items,
+    );
+}
+
+fn renderPartialFailure(output: Output, _: TextPrompt.RenderContext) Output.WriteError!void {
+    try output.write("partial");
+    return error.WriteFailed;
+}
+
+test "failed renderer discards its partial frame" {
+    var input = LineInput.init(&.{.{ .line = "Ada" }});
+    var output = RecordingFrameOutput.init(std.testing.allocator);
+    defer output.deinit();
+
+    var prompt = TextPrompt.init(std.testing.allocator, input.asInput(), output.asOutput(), .{
+        .message = "Name?",
+        .render = renderPartialFailure,
+    });
+
+    try std.testing.expectError(error.OutputFailed, prompt.run());
+    try std.testing.expectEqualStrings("", output.committed.items);
+}
+
+const CancellationAwareLineInput = struct {
+    controller: *AbortController,
+    saw_signal: bool = false,
+
+    fn asInput(self: *CancellationAwareLineInput) Input {
+        return .{ .context = self, .read_line_fn = readLine };
+    }
+
+    fn readLine(context: *anyopaque, signal: ?AbortSignal) Input.ReadError![]const u8 {
+        const self: *CancellationAwareLineInput = @ptrCast(@alignCast(context));
+        const abort_signal = signal orelse return error.ReadFailed;
+        self.saw_signal = true;
+        self.controller.abort();
+        if (abort_signal.isAborted()) return error.Cancelled;
+        return error.ReadFailed;
+    }
+};
+
+const CancellationAwareKeyInput = struct {
+    controller: *AbortController,
+    saw_signal: bool = false,
+
+    fn asInput(self: *CancellationAwareKeyInput) KeyInput {
+        return .{ .context = self, .read_key_fn = readKey };
+    }
+
+    fn readKey(context: *anyopaque, signal: ?AbortSignal) Input.ReadError!KeyEvent {
+        const self: *CancellationAwareKeyInput = @ptrCast(@alignCast(context));
+        const abort_signal = signal orelse return error.ReadFailed;
+        self.saw_signal = true;
+        self.controller.abort();
+        if (abort_signal.isAborted()) return error.Cancelled;
+        return error.ReadFailed;
+    }
+};
+
+test "line and key input adapters receive the abort signal" {
+    var line_controller = AbortController.init();
+    var line_input = CancellationAwareLineInput{ .controller = &line_controller };
+    var line_output = BufferOutput.init(std.testing.allocator);
+    defer line_output.deinit();
+    var line_prompt = TextPrompt.init(std.testing.allocator, line_input.asInput(), line_output.asOutput(), .{
+        .message = "Line?",
+        .signal = line_controller.signal(),
+    });
+
+    try std.testing.expectError(error.Cancelled, line_prompt.run());
+    try std.testing.expect(line_input.saw_signal);
+
+    var key_controller = AbortController.init();
+    var key_input = CancellationAwareKeyInput{ .controller = &key_controller };
+    var key_output = BufferOutput.init(std.testing.allocator);
+    defer key_output.deinit();
+    var key_prompt = TextPrompt.init(std.testing.allocator, null, key_output.asOutput(), .{
+        .message = "Key?",
+        .signal = key_controller.signal(),
+    });
+
+    try std.testing.expectError(error.Cancelled, key_prompt.runKeys(key_input.asInput()));
+    try std.testing.expect(key_input.saw_signal);
 }
 
 test "risu module loads" {
