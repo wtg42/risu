@@ -41,7 +41,9 @@ defer std.heap.page_allocator.free(answer);
 
 Validation callbacks return an optional error message. `initial_value` seeds
 the editable input, while `default_value` is returned only when the submitted
-value is empty. An empty submission does not fall back to `initial_value`.
+value is empty. Validation receives the raw submitted value first; only an
+accepted empty value resolves to `default_value`. An empty submission does not
+fall back to `initial_value`.
 A future prompts layer can build select, confirm, spinner, and other prompt
 types on top of this core without changing the lifecycle contract.
 
@@ -58,14 +60,24 @@ controller.abort();
 // prompt.run() or prompt.runKeys(...) returns error.Cancelled.
 ```
 
-The synchronous input adapter checks the signal before rendering and before and
-after each input read. A blocking adapter must return from its read operation
-before the cancellation can be observed.
+The synchronous input adapter receives the optional signal in its
+`read_line_fn(context, signal)` or `read_key_fn(context, signal)` callback.
+Blocking adapters must wake on cancellation or use bounded waits and check the
+signal. The POSIX example checks it on every poll, so an idle prompt does not
+require another key press before cancellation is observed.
 
 `TextPrompt.Options.render` 可以覆寫 default renderer。每次 prompt draw
 會收到 `TextPrompt.RenderContext`，其中包含 `message`、`placeholder`、目前
-`state`、`value`、`cursor` 與 validation error；renderer 只負責寫入注入的
-`Output`。
+`state`、typed `value`、`cursor`、validation error，以及只在 submit final
+frame 出現的 `submitted_value`。validation error 會保留原輸入；submit 與
+cancel 也會在 `run()` / `runKeys()` 回傳前各 render 一次 final frame。
+
+每次 renderer invocation 都由 `Output` 的 optional frame callbacks 包成單一
+atomic frame；一般 output 可忽略這個 extension。`TerminalFrameOutput` 則會
+buffer 整個 frame，依注入的 terminal columns、rows 與 code-point display
+width 進行 wrapping，跳過相同 frame，並在內容縮短或 resize 後清除殘留列。
+它在第一次 render 時隱藏實體 cursor，並於 `deinit()` 恢復；使用者應以
+`defer` 確保所有成功與錯誤路徑都完成 cleanup。
 
 除了 `run()` 的 line input，core 也提供 `KeyEvent` / `KeyInput` 與
 `runKeys()`，目前支援 character、backspace、clear_line、delete_word、
@@ -84,13 +96,18 @@ Risu 參考 Clack 的 prompt 行為與 `core` / `prompts` 分層，但不逐行�
 - 明確的 prompt lifecycle，以及 submit、cancel、validation error 行為。
 - 可注入 input/output，使 prompt 不依賴 process-global terminal streams。
 - `initial_value`、`default_value`、placeholder 與 validation callback。
-- 可覆寫 renderer，並在每次 draw 提供 state、value、cursor 與 error context。
-- raw key-by-key editing、Ctrl-C/Escape cancellation，以及 resize redraw。
+- 可覆寫 renderer，並在每次 draw 提供 typed/resolved value、state、cursor 與
+  error context。
+- validation-error、submitted 與 cancelled final frames。
+- raw key-by-key editing、可中斷的 blocking adapter、Ctrl-C/Escape cancellation，
+  以及 resize redraw。
+- 注入 terminal capabilities 的 width-aware frame replacement 與 cursor cleanup。
 
-目前尚未實作 Clack 的完整 styled prompts facade、frame diff renderer、全域
-settings/aliases，以及 confirm、select、spinner 等其他 prompt。POSIX raw mode、
-escape-sequence decoding、terminal width 與 ANSI cursor handling 現階段放在
-`examples/basic.zig`，並非 core contract。
+目前尚未實作 Clack 的完整 styled prompts facade、全域 settings/aliases，
+以及 confirm、select、spinner 等其他 prompt。可重用的 frame output 位於
+Risu library；POSIX raw mode、escape-sequence decoding、`ioctl` terminal size
+查詢與 `wcwidth` integration 仍放在 `examples/basic.zig`，並非 platform-neutral
+core contract。
 
 ## Runnable example
 
@@ -128,8 +145,10 @@ and deletion never split a multi-byte character. A standalone Escape becomes
 cancel after a 50 ms continuation timeout (rather than blocking forever while
 waiting for a possible arrow-key sequence). It also observes `SIGWINCH` and
 emits a `resize` event, causing the prompt to redraw while preserving its
-value. The renderer uses `wcwidth` for its cursor cleanup, including wide
-terminal characters.
+value. The adapter supplies live `ioctl` dimensions and `wcwidth` results to
+`TerminalFrameOutput`, which wraps and replaces the frame without stale rows.
+The input adapter uses bounded waits to observe abort signals, while scoped
+cleanup restores raw mode, signal handlers, and cursor visibility.
 
 For the same interactive flow without building first, run
 `zig build run-example`.
